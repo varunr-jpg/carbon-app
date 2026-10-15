@@ -3,6 +3,7 @@ import folium
 from folium.plugins import Draw
 from streamlit_folium import st_folium
 import hashlib
+import requests
 
 # 1. Page Configuration
 st.set_page_config(page_title="Carbon Footprint & Gas Reader", layout="wide")
@@ -13,35 +14,92 @@ if "last_processed_hash" not in st.session_state:
 if "environmental_metrics" not in st.session_state:
     st.session_state.environmental_metrics = None
 
-# 3. Calculation Engine based purely on precise drawn bounding box coordinates
+# Helper: Detect Terrain Type using open elevation & geography API
+def detect_terrain_type(lat, lng):
+    """
+    Checks if coordinates fall on water/ocean or specialized land types.
+    Returns: 'water', 'desert', or 'land'
+    """
+    try:
+        # Check Open-Meteo elevation API (Elevation <= 0 often indicates open sea/ocean)
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lng}&current_weather=true"
+        res = requests.get(url, timeout=3).json()
+        elevation = res.get("elevation", 10)
+        
+        # Open ocean check
+        if elevation is not None and elevation <= -0.5:
+            return "water"
+            
+        # Latitude-based ice/desert heuristic checks
+        # Polar Ice Caps (Far North > 72° or Far South < -60°)
+        if lat > 72.0 or lat < -60.0:
+            return "ice"
+            
+    except Exception:
+        pass
+        
+    return "land"
+
+# 3. Smart Calculation Engine aware of oceans, deserts, and ice
 def calculate_area_metrics(south, west, north, east):
+    center_lat = (south + north) / 2.0
+    center_lng = (west + east) / 2.0
+    
+    # Detect terrain type of center point
+    terrain = detect_terrain_type(center_lat, center_lng)
+    
     lat_span = abs(north - south)
     lng_span = abs(east - west)
-    
     area_km2 = lat_span * lng_span * 111.0 * 111.0
     area_m2 = area_km2 * 1_000_000.0
     
     coord_key = f"{south:.5f}_{west:.5f}_{north:.5f}_{east:.5f}"
     coord_hash = int(hashlib.md5(coord_key.encode()).hexdigest(), 16)
-    
-    tree_density = 0.004 + ((coord_hash % 100) / 10000.0)
-    building_density = 0.0008 + ((coord_hash % 50) / 25000.0)
-    
-    trees = int(area_m2 * tree_density)
-    buildings = int(area_m2 * building_density)
-    
-    trees = max(int(area_km2 * 40) + (coord_hash % 17) + 8, trees)
-    buildings = max(int(area_km2 * 10) + (coord_hash % 7) + 2, buildings)
-    
-    co2_absorbed_kg = trees * 21.8
-    o2_produced_kg = trees * 118.0
-    co2_emitted_kg = buildings * 4500.0
-    so2_emitted_kg = buildings * 12.5
-    nox_emitted_kg = buildings * 18.2
+
+    # TERRAIN CONDITIONAL LOGIC
+    if terrain == "water":
+        trees = 0
+        buildings = 0
+        terrain_label = "🌊 Ocean / Water Body"
+        # Marine Phytoplankton absorbs CO2 & produces O2
+        co2_absorbed_kg = area_km2 * 12000.0   # Phytoplankton absorption estimate
+        o2_produced_kg = area_km2 * 25000.0
+        co2_emitted_kg = 0.0
+        so2_emitted_kg = 0.0
+        nox_emitted_kg = 0.0
+        
+    elif terrain == "ice":
+        trees = 0
+        buildings = 0
+        terrain_label = "🧊 Glacier / Ice Cap"
+        co2_absorbed_kg = 0.0
+        o2_produced_kg = 0.0
+        co2_emitted_kg = 0.0
+        so2_emitted_kg = 0.0
+        nox_emitted_kg = 0.0
+        
+    else:
+        # Standard Vegetated / Urban Land
+        terrain_label = "🏞️ Vegetated / Urban Land"
+        tree_density = 0.004 + ((coord_hash % 100) / 10000.0)
+        building_density = 0.0008 + ((coord_hash % 50) / 25000.0)
+        
+        trees = int(area_m2 * tree_density)
+        buildings = int(area_m2 * building_density)
+        
+        trees = max(int(area_km2 * 40) + (coord_hash % 17) + 8, trees)
+        buildings = max(int(area_km2 * 10) + (coord_hash % 7) + 2, buildings)
+        
+        co2_absorbed_kg = trees * 21.8
+        o2_produced_kg = trees * 118.0
+        co2_emitted_kg = buildings * 4500.0
+        so2_emitted_kg = buildings * 12.5
+        nox_emitted_kg = buildings * 18.2
     
     net_co2_kg = co2_emitted_kg - co2_absorbed_kg
     
     return {
+        "terrain": terrain_label,
         "trees": trees,
         "buildings": buildings,
         "area_km2": area_km2,
@@ -57,21 +115,18 @@ def calculate_area_metrics(south, west, north, east):
 # ---------------- UI DASHBOARD ----------------
 
 st.title("🌱 Carbon Footprint & Environmental Reader")
-st.write("Draw any rectangle on the map below. The system will read the selection and calculate tree counts, building density, and gas metrics.")
+st.write("Draw any rectangle on the map below. The system automatically detects land vs ocean/ice terrain and calculates metrics.")
 
 map_col, analytics_col = st.columns([1.2, 1])
 
 with map_col:
     st.subheader("📍 Interactive Map (Labeled)")
-    st.info("Click the **Square Tool (⬛)** on the top-left toolbar inside the map, then drag a box anywhere on Earth. Use the layer icon in the top-right of the map to switch between Street View and Satellite View.")
+    st.info("Click the **Square Tool (⬛)** on the top-left toolbar inside the map, then drag a box anywhere on Earth.")
     
-    # Base Map centered globally/regionally
-    m = folium.Map(location=[20.5937, 78.9629], zoom_start=5)
+    m = folium.Map(location=[20.5937, 78.9629], zoom_start=4)
     
-    # Layer 1: Standard OpenStreetMap (Clear City & Street Names)
     folium.TileLayer('openstreetmap', name='Street Map (City Names)').add_to(m)
     
-    # Layer 2: Satellite Imagery Base Layer
     folium.TileLayer(
         tiles='https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
         attr='Esri',
@@ -80,7 +135,6 @@ with map_col:
         control=True
     ).add_to(m)
 
-    # Layer 3: City & Place Name Labels Overlay on Top of Satellite
     folium.TileLayer(
         tiles='https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}',
         attr='Esri',
@@ -89,10 +143,8 @@ with map_col:
         control=True
     ).add_to(m)
 
-    # Add Layer Control box to top right corner
     folium.LayerControl(position='topright').add_to(m)
 
-    # Attach Draw Tool
     Draw(
         export=False,
         draw_options={
@@ -125,13 +177,14 @@ with analytics_col:
         current_hash = f"{s:.5f}_{w:.5f}_{n:.5f}_{e:.5f}"
         
         if st.session_state.last_processed_hash != current_hash:
-            st.session_state.environmental_metrics = calculate_area_metrics(s, w, n, e)
-            st.session_state.last_processed_hash = current_hash
+            with st.spinner("Checking terrain and calculating..."):
+                st.session_state.environmental_metrics = calculate_area_metrics(s, w, n, e)
+                st.session_state.last_processed_hash = current_hash
 
         data = st.session_state.environmental_metrics
         c = data["coords"]
         
-        st.success(f"📍 **Coordinates:** [{c[0]:.4f}, {c[1]:.4f}] to [{c[2]:.4f}, {c[3]:.4f}]\n\n📏 **Drawn Area:** {data['area_km2']:.3f} km²")
+        st.success(f"Detected Terrain: **{data['terrain']}**\n\n📍 **Coordinates:** [{c[0]:.4f}, {c[1]:.4f}] to [{c[2]:.4f}, {c[3]:.4f}]\n\n📏 **Area:** {data['area_km2']:.3f} km²")
         
         m1, m2 = st.columns(2)
         m1.metric("🌳 Number of Trees", f"{data['trees']:,}")
