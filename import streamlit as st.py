@@ -14,39 +14,59 @@ if "last_processed_hash" not in st.session_state:
 if "environmental_metrics" not in st.session_state:
     st.session_state.environmental_metrics = None
 
-# Helper: Detect Terrain Type using open elevation & geography API
-def detect_terrain_type(lat, lng):
+# Comprehensive Geographical Terrain Classifier
+def classify_location_terrain(lat, lng):
     """
-    Checks if coordinates fall on water/ocean or specialized land types.
-    Returns: 'water', 'desert', or 'land'
+    Classifies coordinates into 'ocean', 'desert', 'ice', or 'land'.
     """
+    # 1. POLAR / GLACIER CHECK (Antarctica & Far Arctic)
+    if lat < -60.0 or lat > 72.0:
+        return "ice"
+
+    # 2. OCEAN & WATER BODY CHECK
+    # Queries the OpenStreetMap Nominatim reverse geocoder for land/water class
     try:
-        # Check Open-Meteo elevation API (Elevation <= 0 often indicates open sea/ocean)
-        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lng}&current_weather=true"
-        res = requests.get(url, timeout=3).json()
-        elevation = res.get("elevation", 10)
+        url = f"https://nominatim.openstreetmap.org/reverse?lat={lat}&lon={lng}&format=json&zoom=5"
+        headers = {'User-Agent': 'CarbonFootprintApp/2.0'}
+        res = requests.get(url, headers=headers, timeout=2.5).json()
         
-        # Open ocean check
-        if elevation is not None and elevation <= -0.5:
-            return "water"
-            
-        # Latitude-based ice/desert heuristic checks
-        # Polar Ice Caps (Far North > 72° or Far South < -60°)
-        if lat > 72.0 or lat < -60.0:
-            return "ice"
-            
+        # Check if location is flagged as ocean/sea/water body
+        category = res.get("category", "")
+        type_tag = res.get("type", "")
+        error_msg = res.get("error", "")
+        
+        if "water" in category or type_tag in ["ocean", "sea", "water", "bay", "strait"] or "Unable to geocode" in error_msg:
+            # Fallback verification via open elevation API
+            elev_url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lng}&current_weather=true"
+            elev_res = requests.get(elev_url, timeout=2).json()
+            elevation = elev_res.get("elevation", 0)
+            if elevation <= 0:
+                return "ocean"
     except Exception:
         pass
-        
+
+    # 3. MAJOR DESERT BELTS CHECK (Coordinates bounding global arid zones)
+    # Sahara & Arabian Desert (12°N - 35°N, 17°W - 60°E)
+    if (12.0 <= lat <= 35.0) and (-17.0 <= lng <= 60.0):
+        return "desert"
+    # Australian Outback (-30°S - -18°S, 115°E - 140°E)
+    elif (-30.0 <= lat <= -18.0) and (115.0 <= lng <= 140.0):
+        return "desert"
+    # Gobi Desert (38°N - 46°N, 95°E - 115°E)
+    elif (38.0 <= lat <= 46.0) and (95.0 <= lng <= 115.0):
+        return "desert"
+    # Kalahari & Namib Desert (-28°S - -18°S, 14°E - 26°E)
+    elif (-28.0 <= lat <= -18.0) and (14.0 <= lng <= 26.0):
+        return "desert"
+
     return "land"
 
-# 3. Smart Calculation Engine aware of oceans, deserts, and ice
+# Environmental Calculation Engine
 def calculate_area_metrics(south, west, north, east):
     center_lat = (south + north) / 2.0
     center_lng = (west + east) / 2.0
     
-    # Detect terrain type of center point
-    terrain = detect_terrain_type(center_lat, center_lng)
+    terrain = classify_location_terrain(center_lat, center_lng)
     
     lat_span = abs(north - south)
     lng_span = abs(east - west)
@@ -56,14 +76,14 @@ def calculate_area_metrics(south, west, north, east):
     coord_key = f"{south:.5f}_{west:.5f}_{north:.5f}_{east:.5f}"
     coord_hash = int(hashlib.md5(coord_key.encode()).hexdigest(), 16)
 
-    # TERRAIN CONDITIONAL LOGIC
-    if terrain == "water":
+    # TERRAIN LOGIC OVERRIDES
+    if terrain == "ocean":
         trees = 0
         buildings = 0
-        terrain_label = "🌊 Ocean / Water Body"
-        # Marine Phytoplankton absorbs CO2 & produces O2
-        co2_absorbed_kg = area_km2 * 12000.0   # Phytoplankton absorption estimate
-        o2_produced_kg = area_km2 * 25000.0
+        terrain_label = "🌊 Ocean / Open Water"
+        # Oceanic Marine Phytoplankton Carbon Fixation
+        co2_absorbed_kg = area_km2 * 14500.0
+        o2_produced_kg = area_km2 * 28000.0
         co2_emitted_kg = 0.0
         so2_emitted_kg = 0.0
         nox_emitted_kg = 0.0
@@ -77,9 +97,21 @@ def calculate_area_metrics(south, west, north, east):
         co2_emitted_kg = 0.0
         so2_emitted_kg = 0.0
         nox_emitted_kg = 0.0
+
+    elif terrain == "desert":
+        # Deserts have sparse vegetation and minimal structures
+        terrain_label = "🏜️ Arid / Desert Terrain"
+        trees = int(area_km2 * 1.5)        # Sparse desert scrub/cacti
+        buildings = int(area_km2 * 0.2)    # Sparse remote structures
         
+        co2_absorbed_kg = trees * 5.0      # Lower sequestration per desert shrub
+        o2_produced_kg = trees * 25.0
+        co2_emitted_kg = buildings * 1200.0
+        so2_emitted_kg = buildings * 2.0
+        nox_emitted_kg = buildings * 3.0
+
     else:
-        # Standard Vegetated / Urban Land
+        # Standard Vegetated Land / Urban Zone
         terrain_label = "🏞️ Vegetated / Urban Land"
         tree_density = 0.004 + ((coord_hash % 100) / 10000.0)
         building_density = 0.0008 + ((coord_hash % 50) / 25000.0)
@@ -115,7 +147,7 @@ def calculate_area_metrics(south, west, north, east):
 # ---------------- UI DASHBOARD ----------------
 
 st.title("🌱 Carbon Footprint & Environmental Reader")
-st.write("Draw any rectangle on the map below. The system automatically detects land vs ocean/ice terrain and calculates metrics.")
+st.write("Draw any rectangle on the map below. The system automatically detects oceans, deserts, glaciers, and urban land.")
 
 map_col, analytics_col = st.columns([1.2, 1])
 
@@ -177,14 +209,14 @@ with analytics_col:
         current_hash = f"{s:.5f}_{w:.5f}_{n:.5f}_{e:.5f}"
         
         if st.session_state.last_processed_hash != current_hash:
-            with st.spinner("Checking terrain and calculating..."):
+            with st.spinner("Checking terrain classification..."):
                 st.session_state.environmental_metrics = calculate_area_metrics(s, w, n, e)
                 st.session_state.last_processed_hash = current_hash
 
         data = st.session_state.environmental_metrics
         c = data["coords"]
         
-        st.success(f"Detected Terrain: **{data['terrain']}**\n\n📍 **Coordinates:** [{c[0]:.4f}, {c[1]:.4f}] to [{c[2]:.4f}, {c[3]:.4f}]\n\n📏 **Area:** {data['area_km2']:.3f} km²")
+        st.success(f"Detected Environment: **{data['terrain']}**\n\n📍 **Coordinates:** [{c[0]:.4f}, {c[1]:.4f}] to [{c[2]:.4f}, {c[3]:.4f}]\n\n📏 **Area:** {data['area_km2']:.3f} km²")
         
         m1, m2 = st.columns(2)
         m1.metric("🌳 Number of Trees", f"{data['trees']:,}")
